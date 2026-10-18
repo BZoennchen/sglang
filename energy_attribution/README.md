@@ -22,6 +22,7 @@ Details and the optional improvements are in [PLAN.md](PLAN.md).
 | [`PLAN.md`](PLAN.md) | Phases, design notes, optional improvements |
 | [`docs/step_trace.md`](docs/step_trace.md) | Trace format reference: env vars, record fields, clock, validation |
 | [`tools/step_trace_client.py`](tools/step_trace_client.py) | Sends a concurrent workload and checks a trace against it |
+| [`tools/plot_step_trace.py`](tools/plot_step_trace.py) | Plots a trace (and its manifest) for visual sanity checks; needs pandas + matplotlib |
 | `runs/<date>_<name>/` | One folder per experiment (git-ignored): `trace.jsonl`, `manifest.json`, `server_cmd.txt` |
 | `papers/` | Reference PDFs (git-ignored) |
 
@@ -101,6 +102,10 @@ If the client runs on another machine, fetch the trace first, e.g.
 The tracer writes buffered records when the server goes idle, so wait a few
 seconds after `send` finishes. With tensor parallelism, check each rank's file
 separately.
+
+Optionally plot it: `python3 energy_attribution/tools/plot_step_trace.py
+--trace "energy_attribution/runs/$RUN/step_trace.*.jsonl" --manifest
+energy_attribution/runs/$RUN/manifest.json` writes four PNGs into the run folder.
 
 **4. Record the configuration.** Write the exact server and client commands
 into `runs/$RUN/server_cmd.txt`, so every trace can be traced back to the setup

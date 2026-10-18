@@ -5,7 +5,7 @@
         --model-path Qwen/Qwen2.5-1.5B-Instruct --port 30000 --disable-overlap-schedule
 
     # 2. send a concurrent workload, record what the server reported per rid:
-    python energy_attribution/tools/step_trace_client.py send --url http://localhost:30000 --out manifest.json
+    python energy_attribution/tools/step_trace_client.py send --url http://<server>:30000 --out manifest.json
 
     # 3. check the trace against the manifest:
     python energy_attribution/tools/step_trace_client.py check --manifest manifest.json \
@@ -21,6 +21,7 @@ import random
 import sys
 import urllib.request
 import uuid
+from typing import Any
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
@@ -31,12 +32,17 @@ SHARED_PREFIX = (
 WORDS = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu".split()
 
 
-def _now_ns():
-    # Same clock as the trace (see step_tracer.py).
+def _now_ns() -> int:
+    """Current time in ns on CLOCK_MONOTONIC_RAW, the clock the step trace uses.
+
+    The raw clock is never slewed, unlike time.monotonic_ns(), which drifted 2-4%
+    against the GPU timer under WSL2. Not available on native Windows.
+    """
     return time.clock_gettime_ns(time.CLOCK_MONOTONIC_RAW)
 
 
-def _post(url, payload, timeout=600):
+def _post(url: str, payload: dict, timeout: int=600) -> Any:
+    """POST payload as JSON to url and return the decoded JSON response."""
     req = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
@@ -46,13 +52,34 @@ def _post(url, payload, timeout=600):
         return json.loads(resp.read())
 
 
-def _make_prompt(rng, i, shared_prefix):
+def _make_prompt(rng: random.Random, i: int, shared_prefix: bool) -> str:
+    """Build a synthetic prompt for request i.
+
+    The body is 20-1500 random words, so prompt lengths vary widely and long
+    prompts exceed a small --chunked-prefill-size (chunked prefill). With
+    shared_prefix, the prompt starts with SHARED_PREFIX, so every such request
+    after the first can reuse it from the radix cache (prefix reuse).
+    """
     body = " ".join(rng.choice(WORDS) for _ in range(rng.randint(20, 1500)))
     head = SHARED_PREFIX if shared_prefix else ""
     return f"{head}Request {i}: summarize this list: {body}"
 
 
-def _one_request(url, rid, prompt, max_new_tokens, delay_s):
+def _one_request(
+    url: str, rid: str, prompt: str, max_new_tokens: int, delay_s: float
+) -> dict:
+    """Send one /generate request after delay_s and return its manifest record.
+
+    The request carries our own rid, so the server uses it as the request ID and
+    its owner rows in the trace can be joined back to this record. ignore_eos
+    stops the model from ending early at its end-of-sequence token, so the
+    request generates exactly max_new_tokens (unless aborted or cut off by the
+    context length); generation lengths then come from the seeded workload, not
+    from the model. Greedy sampling (temperature 0) makes the output
+    deterministic; it does not affect the length. The record keeps what
+    the server reports in meta_info (prompt, completion and cached tokens): the
+    reference the trace is checked against.
+    """
     time.sleep(delay_s)
     t_send = _now_ns()
     out = _post(
@@ -80,10 +107,21 @@ def _one_request(url, rid, prompt, max_new_tokens, delay_s):
     }
 
 
-def cmd_send(args):
+def cmd_send(args: argparse.Namespace) -> None:
+    """Send a concurrent workload and write the server's per-request report.
+
+    Builds --num-requests jobs with seeded randomness (same --seed, same
+    workload), each with a unique rid, a prompt (every second one with the
+    shared prefix), a random max_new_tokens up to --max-new-tokens, and a random
+    start delay within --arrival-spread-s. Staggered arrivals make new prefills
+    land while others decode, which produces mixed batches. Up to --concurrency
+    requests are in flight at once. Writes the list of records from _one_request
+    to --out (manifest.json).
+    """
     rng = random.Random(args.seed)
     jobs = []
     for i in range(args.num_requests):
+        # These are the arguments (except url) for _one_request
         jobs.append(
             dict(
                 rid=f"st-{uuid.uuid4().hex[:12]}-{i}",
@@ -101,7 +139,11 @@ def cmd_send(args):
     print(f"wrote {len(results)} request records to {args.out}")
 
 
-def _load_trace(path):
+def _load_trace(path: str) -> dict:
+    """Read a trace JSONL file into lists of records keyed by their kind.
+
+    Returns {"meta": [...], "anchor": [...], "step": [...], "owner": [...]}.
+    """
     records = defaultdict(list)
     with open(path) as f:
         for line in f:
@@ -110,7 +152,30 @@ def _load_trace(path):
     return records
 
 
-def cmd_check(args):
+def cmd_check(args: argparse.Namespace) -> None:
+    """Validate a step trace against the manifest from the same run.
+
+    Step checks, on the trace alone:
+    - every step has a positive duration;
+    - without overlap, steps do not overlap in time, and each GPU window
+      [t_start_ns, t_end_ns] lies inside its host window [host_launch_begin_ns,
+      host_result_ns], within the anchor uncertainty plus --clock-tolerance-ns;
+    - the number of owner rows equals batch_size (for traced steps);
+    - the owners' selected_tokens sum to the step's prefill + decode tokens.
+
+    Request checks, trace against the server's report (manifest):
+    - every manifest request has owner rows;
+    - prefill tokens computed + prefix reused = prompt_tokens;
+    - prefix reused = the server's cached_tokens;
+    - decode rows = completion_tokens - 1 (the prefill step samples the first
+      token, each decode step one more);
+    - the last prefill chunk is not marked is_chunked.
+    Retracted requests are skipped, since their prefill was partly recomputed.
+
+    Prints the worst anchor uncertainty, the largest GPU-outside-host skew and
+    how many mixed, chunked and prefix-reuse rows the run exercised. Exits with
+    status 1 and lists up to 50 failures if any check fails.
+    """
     with open(args.manifest) as f:
         manifest = {r["rid"]: r for r in json.load(f)}
     trace = _load_trace(args.trace)
@@ -209,7 +274,8 @@ def cmd_check(args):
     print("\nOK")
 
 
-def main():
+def main() -> None:
+    """Parse the command line and run the send or check subcommand."""
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="cmd", required=True)
     p = sub.add_parser("send")

@@ -38,7 +38,7 @@ Inference Requests in LLM Serving Systems" (§III-C Instrumentation Points in SG
   2. Radix prefix reuse: `len(req.prefix_indices)` = cached tokens, `extend_input_len` = built.
   3. Chunked prefill (`req.is_chunked`) and mixed batches (`batch.decoding_reqs`).
   4. Retraction = recompute (`ScheduleBatch.retract_decode`, `req.retraction_count`).
-  5. COW likely N/A in SGLang (verify).
+  5. COW: verified N/A for attention KV (see "Coverage of Seam's activity vector").
   6. Out of scope first: spec decoding, DP attention, PP, PD disaggregation.
   7. Join key: `req.rid`.
 
@@ -48,6 +48,45 @@ Inference Requests in LLM Serving Systems" (§III-C Instrumentation Points in SG
 - Owner record (per request per step): step_id, rid, phase, selected_tokens
   (extend_input_len or 1), context_len (seqlen), cached_tokens, is_chunked, retraction_count.
 - Buffered JSONL sidecar written by the scheduler process (not via OTel/meta_info).
+
+## Coverage of Seam's activity vector
+Seam's Eq. 1 splits dynamic energy by Prefill + Decode + KV-read + Prefix + COW + Recompute
+(Table 6: KV-read, prefix, COW and recompute are optional fields). State of our trace:
+
+| Seam term | Our trace |
+|---|---|
+| Prefill tokens (incl. chunks) | Yes: `selected_tokens` with `phase: prefill`, `is_chunked` |
+| Decode tokens | Yes: `selected_tokens` with `phase: decode` |
+| KV-cache read | Yes: owner `context_len - selected_tokens`, step `kv_read_tokens` |
+| Shared prefix, hit | Yes: owner `cached_tokens`, `req_cached_tokens` |
+| Shared prefix, build role + prefix id | **Missing** |
+| Recompute | Partly: `retraction_count` only, no recomputed-token count |
+| COW | N/A for attention KV (below); only Mamba state in hybrid models |
+| Callsite / application span | Client side, joined on `rid` (same as Seam) |
+
+Follow-ups, in priority order:
+1. **Prefix build role and prefix id (main trace gap).** Needed for Seam's default
+   builder-pays prefix policy (prefix-build activity charged to the request that built it,
+   warm hits charged nothing) and its amortized variant (build cost spread over all requests
+   sharing the prefix id). At prefill, SGLang knows the matched radix node (`req.last_node`,
+   a `TreeNode` with a stable `id`, mem_cache/radix_cache.py). Record that id per prefill
+   owner row as the prefix group. Builder role can be derived offline: the first request
+   whose computed tokens later appear as another request's cache hit. A fully online role
+   would need a hook where SGLang inserts nodes into the radix tree.
+2. **Recompute tokens.** Derivable offline: after a retraction, a request's prefill tokens up
+   to the context length it had already reached are recomputation. Optional explicit field
+   `recompute_tokens` on owner rows. Retraction has not been exercised in tests yet.
+3. **Mamba COW**, only if hybrid SSM models are traced: count copies from
+   `mamba_cow_src_index` / `batch.mamba_cow_src_indices`. Out of scope for now.
+
+Why COW is N/A: vLLM shares partially filled KV blocks, so diverging requests trigger block
+copies. SGLang's radix cache matches only whole pages (`RadixKey.page_aligned`; default page
+size 1 has no partial pages), so diverging requests write new KV and nothing is copied.
+
+Context from Seam Table 3: the full vector did not clearly beat token counts on magnitude;
+KV-read drove the improvement on decode-heavy and phase-mix cases, prefix/COW mainly affect
+ranking and policy. So the term that mattered most is already covered; the prefix role
+decides who pays for shared prefixes.
 
 ## Phases
 1. StepTracer component `python/sglang/srt/managers/scheduler_components/step_tracer.py`.
