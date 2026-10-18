@@ -29,40 +29,100 @@ The tracer itself lives in the SGLang package:
 `python/sglang/srt/managers/scheduler_components/step_tracer.py`, wired into
 `python/sglang/srt/managers/scheduler.py`.
 
-## Running a traced experiment
+## Running a traced experiment (Docker)
 
-On the tower, inside the `sglang-dev` container (the repo is mounted at
-`/workspace/sglang`):
+Requirements on the server machine: an NVIDIA GPU, Docker with the NVIDIA
+Container Toolkit (`docker run --gpus all` works), and git.
+
+**1. Clone the fork.**
 
 ```bash
-RUN=/workspace/sglang/energy_attribution/runs/$(date +%F)_my-run
-mkdir -p $RUN
-
-SGLANG_ENABLE_STEP_TRACE=1 SGLANG_STEP_TRACE_DIR=$RUN \
-SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-1.5B-Instruct \
-    --host 0.0.0.0 --port 30000 --disable-overlap-schedule
-
-python energy_attribution/tools/step_trace_client.py send --out $RUN/manifest.json
-python energy_attribution/tools/step_trace_client.py check \
-    --manifest $RUN/manifest.json --trace $RUN/step_trace.*.jsonl
+git clone -b resource-tracking https://github.com/BZoennchen/sglang.git
+cd sglang
 ```
 
-Write the exact server and client commands into `$RUN/server_cmd.txt`, so every
-trace can be traced back to the configuration that produced it. See
-[`runs/2026-10-16_mixed-chunk/server_cmd.txt`](runs/2026-10-16_mixed-chunk/server_cmd.txt)
-for an example (local only).
+**2. Start a traced server.** This runs the official SGLang image, mounts the
+fork over it, installs the fork in editable mode and starts the server. Traces
+land in `energy_attribution/runs/$RUN` on the host.
 
-## Tower notes
+```bash
+MODEL=Qwen/Qwen2.5-1.5B-Instruct
+RUN=$(date +%F)_my-run
+mkdir -p energy_attribution/runs/$RUN
 
-- Time base: all trace timestamps use `CLOCK_MONOTONIC_RAW`. Under WSL2,
-  `time.monotonic_ns()` is slewed 2-4% against the GPU timer; any power sampler
-  must use the raw clock too.
-- `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` is needed because the
-  container was installed without the Rust extensions.
-- Stop a server with Ctrl-C in its tmux session. Killing the tmux session leaves
-  the server running inside the container; then use
-  `docker exec sglang-dev pkill -f "launch_server|sglang::"`.
+docker run --rm -it --init --name sglang-trace \
+    --gpus all --shm-size 32g --ipc=host -p 30000:30000 \
+    -v "$PWD":/workspace/sglang -w /workspace/sglang \
+    -v ~/.cache/huggingface:/root/.cache/huggingface \
+    -e HF_TOKEN \
+    -e SGLANG_ENABLE_STEP_TRACE=1 \
+    -e SGLANG_STEP_TRACE_DIR=/workspace/sglang/energy_attribution/runs/$RUN \
+    -e SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
+    lmsysorg/sglang:v0.5.21 \
+    bash -c "SGLANG_BUILD_RUST_EXTS=none pip install -q -e python --no-deps && \
+             python -m sglang.launch_server --model-path $MODEL \
+                 --host 0.0.0.0 --port 30000 --disable-overlap-schedule"
+```
+
+- `--disable-overlap-schedule` is required for now: with the overlap scheduler
+  (SGLang's default) the trace contains only its header lines.
+- To exercise chunked and mixed steps, append
+  `--chunked-prefill-size 1024 --enable-mixed-chunk`.
+- Supported: one GPU, or plain tensor parallelism (`--tp N`, one trace file per
+  rank). Not supported: speculative decoding, DP attention, pipeline
+  parallelism, PD disaggregation.
+- The image tag matches the fork's base release (v0.5.21), so `--no-deps`
+  reuses the image's dependencies.
+- `SGLANG_BUILD_RUST_EXTS=none` skips building the Rust extensions (the image
+  has no Rust toolchain); `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` then
+  selects the pure-Python radix tree, without which startup fails.
+- `-e HF_TOKEN` passes your token through for gated models; drop it otherwise.
+- Stop the server with Ctrl-C, or `docker stop sglang-trace` from another shell.
+
+**3. Send the workload and check the trace.** The client needs only Python 3
+(standard library) on Linux, macOS or WSL; it does not run on native Windows.
+It can run on the server machine or on any machine that reaches port 30000.
+
+```bash
+# Wait until the server answers
+until curl -sf http://<server>:30000/health_generate >/dev/null; do sleep 5; done
+
+python3 energy_attribution/tools/step_trace_client.py send --url http://<server>:30000 \
+    --out energy_attribution/runs/$RUN/manifest.json \
+    --num-requests 160 --concurrency 48 --max-new-tokens 512 --arrival-spread-s 20
+
+python3 energy_attribution/tools/step_trace_client.py check \
+    --manifest energy_attribution/runs/$RUN/manifest.json \
+    --trace energy_attribution/runs/$RUN/step_trace.*.jsonl
+```
+
+If the client runs on another machine, fetch the trace first, e.g.
+`rsync -av <server>:sglang/energy_attribution/runs/$RUN/ energy_attribution/runs/$RUN/`.
+The tracer writes buffered records when the server goes idle, so wait a few
+seconds after `send` finishes. With tensor parallelism, check each rank's file
+separately.
+
+**4. Record the configuration.** Write the exact server and client commands
+into `runs/$RUN/server_cmd.txt`, so every trace can be traced back to the setup
+that produced it.
+
+## Notes
+
+- **Clock.** All trace timestamps use `CLOCK_MONOTONIC_RAW`, not
+  `time.monotonic_ns()`. Under WSL2 the latter was slewed 2-4% against the GPU
+  timer; on native Linux the difference is negligible. Any power sampler joined
+  with the trace must use the raw clock too. Client timestamps in the manifest
+  are only comparable with the trace when the client runs on the server machine.
+- **File ownership.** The container runs as root, so trace files on the host are
+  owned by root. Use `sudo chown -R $USER energy_attribution/runs` if needed.
+- **Prompt sizes.** The client's prompts reach about 2,000-2,500 tokens plus
+  `--max-new-tokens`; lower `--max-new-tokens` for models with a small context
+  window.
+- **Check failures that are not tracer bugs:** overlap scheduler on (no steps),
+  speculative decoding (no owner rows), beam search (member rows dropped),
+  aborted requests (token counts differ). Retracted requests are skipped. On
+  very different hardware, `--clock-tolerance-ns` (default 0.2 ms) may need
+  loosening; the printed anchor uncertainty is its floor.
 
 ## Papers
 

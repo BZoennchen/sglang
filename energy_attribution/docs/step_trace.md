@@ -29,20 +29,11 @@ The tracer is off by default. When it is off, the hooks are no-ops.
 | `SGLANG_STEP_TRACE_FLUSH_STEPS` | `256` | Buffered records are written after this many steps, and whenever the scheduler goes idle. |
 | `SGLANG_STEP_TRACE_REANCHOR_INTERVAL_S` | `10.0` | How often (at most) to re-pair the GPU clock with the host clock. |
 
-Example (inside the `sglang-dev` container):
-
-```bash
-SGLANG_ENABLE_STEP_TRACE=1 \
-SGLANG_STEP_TRACE_DIR=/workspace/sglang/energy_attribution/runs/<run name> \
-SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
-python -m sglang.launch_server --model-path Qwen/Qwen2.5-1.5B-Instruct \
-    --host 0.0.0.0 --port 30000 --disable-overlap-schedule
-```
-
-`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` is only needed in containers
-where the Rust extensions were not built. Pointing `SGLANG_STEP_TRACE_DIR` into
-the mounted repo makes the trace visible outside the container; the default
-`/tmp` is container-local and needs `docker cp`.
+For a complete Docker launch command, see
+[Running a traced experiment](../README.md#running-a-traced-experiment-docker)
+in the README. Pointing `SGLANG_STEP_TRACE_DIR` into the mounted repo makes the
+trace visible outside the container; the default `/tmp` is container-local and
+needs `docker cp`.
 
 Each scheduler process writes one file:
 `step_trace.<rank_tag>.<pid>.jsonl`, e.g. `step_trace.dp0_tp0_pp0.3048.jsonl`.
